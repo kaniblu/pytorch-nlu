@@ -146,7 +146,7 @@ class Predictor(object):
                 label_bos=self.bos_idxs[1],
             )
             labels, intents, lens, pl, pi = \
-                [x.cpu().tolist() for x in [labels, intents, lens, pl, pi]]
+                [x.cpu().tolist() for x in [labels, intents, lens, pl[:, 0], pi]]
             labels = [self.to_sent(label[:l], vocabs[1])
                       for label, l in zip(labels, lens)]
             intents = [self.to_sent([i], vocabs[2]) for i in intents]

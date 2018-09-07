@@ -41,9 +41,14 @@ class AbstractJointLU(common.Module):
 class SimpleLU(AbstractJointLU):
     name = "simple-jlu"
 
-    def __init__(self, *args, word_embed=embedding.AbstractEmbedding, **kwargs):
+    def __init__(self, *args, dropout=False, dropout_prob=0.5,
+                 word_embed=embedding.AbstractEmbedding, **kwargs):
         super(SimpleLU, self).__init__(*args, **kwargs)
+        self.should_dropout = dropout
+        self.dropout_prob = dropout_prob
         self.word_embed_cls = word_embed
+
+        self.dropout = nn.Dropout(p=dropout_prob)
         self.word_embed = self.word_embed_cls(
             vocab_size=self.num_words,
             dim=self.word_dim
@@ -64,7 +69,11 @@ class SimpleLU(AbstractJointLU):
 
     def forward_loss(self, w, l, lens):
         w_emb = self.invoke(self.word_embed, w)
+        if self.should_dropout:
+            w_emb = self.dropout(w_emb)
         whs, (wh, _) = self.lstm(w_emb)
+        if self.should_dropout:
+            whs, wh = self.dropout(whs), self.dropout(wh)
         wh = wh.permute(1, 0, 2).contiguous()
         wh = wh.view(-1, self.hidden_dim * 2)
         lgts = self.label_output(whs)
@@ -75,78 +84,80 @@ class SimpleLU(AbstractJointLU):
         lgts, igts = self.forward_loss(w, None, lens)
         lprobs = nf.softmax(lgts, 2)
         iprobs = nf.softmax(igts, 1)
-        return (lgts.max(2)[1], igts.max(1)[1]), (lprobs, iprobs)
+        lprobs, labels = lprobs.max(2)
+        lprobs = lprobs.prod(1).unsqueeze(1)
+        return (labels, igts.max(1)[1]), (lprobs, iprobs)
 
 
-class RNNJointLU(AbstractJointLU):
-    name = "rnn-jlu"
-
-    def __init__(self, *args, dropout_prob=0.5, dropout="outer",
-                 word_embed=embedding.AbstractEmbedding,
-                 label_embed=embedding.AbstractEmbedding,
-                 intent_embed=embedding.AbstractEmbedding,
-                 pooling=pooling.AbstractPooling,
-                 rnn_cell=rnncell.AbstractRNNCell, **kwargs):
-        super(RNNJointLU, self).__init__(*args, **kwargs)
-        self.dropout_prob = dropout_prob
-        self.word_embed_cls = word_embed
-        self.label_embed_cls = label_embed
-        self.intent_embed_cls = intent_embed
-        self.pooling_cls = pooling
-        self.rnn_cls = rnn_cell
-        self.dropout_loc = dropout
-        self.dropout = nn.Dropout(p=self.dropout_prob)
-        self.word_embed = self.word_embed_cls(
-            vocab_size=self.num_words,
-            dim=self.word_dim
-        )
-        self.label_embed = self.label_embed_cls(
-            vocab_size=self.num_labels,
-            dim=self.label_dim
-        )
-        self.intent_embed = self.intent_embed_cls(
-            vocab_size=self.num_intents,
-            dim=self.intent_dim
-        )
-        self.rnn = self.rnn_cls(
-            input_dim=self.word_dim,
-            hidden_dim=self.hidden_dim
-        )
-        self.label_layer = nonlinear.get_default()(
-            in_dim=self.hidden_dim,
-            out_dim=self.label_dim
-        )
-        self.intent_pooling = self.pooling_cls(
-            dim=self.hidden_dim
-        )
-        self.intent_layer = nonlinear.get_default()(
-            in_dim=self.hidden_dim,
-            out_dim=self.intent_dim
-        )
-
-    def embeddings(self):
-        return [self.word_embed, self.label_embed, self.intent_embed]
-
-    def forward_loss(self, w, l, lens):
-        w_emb = self.invoke(self.word_embed, w)
-        whs, _, _ = self.invoke(self.rnn, w_emb, lens)
-        if self.dropout_loc in {"inner", "both"}:
-            whs = self.dropout(whs)
-        lhs = self.invoke(self.label_layer, whs)
-        wh = self.invoke(self.intent_pooling, whs)
-        ih = self.invoke(self.intent_layer, wh)
-        if self.dropout_loc in {"outer", "both"}:
-            lhs = self.dropout(lhs)
-            ih = self.dropout(ih)
-        lgts = mutils.embed_dot(self.label_embed, lhs)
-        igts = mutils.embed_dot(self.intent_embed, ih)
-        return lgts, igts
-
-    def predict(self, w, lens, label_bos):
-        lgts, igts = self.forward_loss(w, None, lens)
-        lprobs = nf.softmax(lgts, 2)
-        iprobs = nf.softmax(igts, 1)
-        return (lgts.max(2)[1], igts.max(1)[1]), (lprobs, iprobs)
+# class RNNJointLU(AbstractJointLU):
+#     name = "rnn-jlu"
+#
+#     def __init__(self, *args, dropout_prob=0.5, dropout="outer",
+#                  word_embed=embedding.AbstractEmbedding,
+#                  label_embed=embedding.AbstractEmbedding,
+#                  intent_embed=embedding.AbstractEmbedding,
+#                  pooling=pooling.AbstractPooling,
+#                  rnn_cell=rnncell.AbstractRNNCell, **kwargs):
+#         super(RNNJointLU, self).__init__(*args, **kwargs)
+#         self.dropout_prob = dropout_prob
+#         self.word_embed_cls = word_embed
+#         self.label_embed_cls = label_embed
+#         self.intent_embed_cls = intent_embed
+#         self.pooling_cls = pooling
+#         self.rnn_cls = rnn_cell
+#         self.dropout_loc = dropout
+#         self.dropout = nn.Dropout(p=self.dropout_prob)
+#         self.word_embed = self.word_embed_cls(
+#             vocab_size=self.num_words,
+#             dim=self.word_dim
+#         )
+#         self.label_embed = self.label_embed_cls(
+#             vocab_size=self.num_labels,
+#             dim=self.label_dim
+#         )
+#         self.intent_embed = self.intent_embed_cls(
+#             vocab_size=self.num_intents,
+#             dim=self.intent_dim
+#         )
+#         self.rnn = self.rnn_cls(
+#             input_dim=self.word_dim,
+#             hidden_dim=self.hidden_dim
+#         )
+#         self.label_layer = nonlinear.get_default()(
+#             in_dim=self.hidden_dim,
+#             out_dim=self.label_dim
+#         )
+#         self.intent_pooling = self.pooling_cls(
+#             dim=self.hidden_dim
+#         )
+#         self.intent_layer = nonlinear.get_default()(
+#             in_dim=self.hidden_dim,
+#             out_dim=self.intent_dim
+#         )
+#
+#     def embeddings(self):
+#         return [self.word_embed, self.label_embed, self.intent_embed]
+#
+#     def forward_loss(self, w, l, lens):
+#         w_emb = self.invoke(self.word_embed, w)
+#         whs, _, _ = self.invoke(self.rnn, w_emb, lens)
+#         if self.dropout_loc in {"inner", "both"}:
+#             whs = self.dropout(whs)
+#         lhs = self.invoke(self.label_layer, whs)
+#         wh = self.invoke(self.intent_pooling, whs)
+#         ih = self.invoke(self.intent_layer, wh)
+#         if self.dropout_loc in {"outer", "both"}:
+#             lhs = self.dropout(lhs)
+#             ih = self.dropout(ih)
+#         lgts = mutils.embed_dot(self.label_embed, lhs)
+#         igts = mutils.embed_dot(self.intent_embed, ih)
+#         return lgts, igts
+#
+#     def predict(self, w, lens, label_bos):
+#         lgts, igts = self.forward_loss(w, None, lens)
+#         lprobs = nf.softmax(lgts, 2)
+#         iprobs = nf.softmax(igts, 1)
+#         return (lgts.max(2)[1], igts.max(1)[1]), (lprobs, iprobs)
 
 
 class AttentiveJointLU(AbstractJointLU):
@@ -299,7 +310,7 @@ class AttentiveJointLU(AbstractJointLU):
 class SlotGatedJointLU(AbstractJointLU):
     name = "slotgated-jlu"
 
-    def __init__(self, *args,
+    def __init__(self, *args, dropout_prob=0.5,
                  word_embed=embedding.AbstractEmbedding,
                  label_embed=embedding.AbstractEmbedding,
                  intent_embed=embedding.AbstractEmbedding,
@@ -307,6 +318,7 @@ class SlotGatedJointLU(AbstractJointLU):
                  label_attention=attention.AbstractAttention,
                  intent_attention=attention.AbstractAttention, **kwargs):
         super(SlotGatedJointLU, self).__init__(*args, **kwargs)
+        self.dropout_prob = dropout_prob
         self.word_embed_cls = word_embed
         self.label_embed_cls = label_embed
         self.intent_embed_cls = intent_embed
@@ -325,6 +337,7 @@ class SlotGatedJointLU(AbstractJointLU):
             vocab_size=self.num_intents,
             dim=self.intent_dim
         )
+        self.dropout = nn.Dropout(p=dropout_prob)
         self.word_rnn = self.word_rnn_cls(
             input_dim=self.word_dim,
             hidden_dim=self.hidden_dim,
@@ -367,8 +380,9 @@ class SlotGatedJointLU(AbstractJointLU):
         return x.sum(2)
 
     def forward_loss(self, w, l, lens):
-        w = self.invoke(self.word_embed, w)
+        w = self.dropout(self.invoke(self.word_embed, w))
         whs, _, wh = self.invoke(self.word_rnn, w, lens)
+        whs, wh = self.dropout(whs), self.dropout(wh)
         ih = self.invoke(self.intent_attention, wh.unsqueeze(1), whs, lens)
         ih = ih.squeeze(1)
         lhs = self.invoke(self.label_attention, whs, whs, lens)

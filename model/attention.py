@@ -112,6 +112,7 @@ class AdditiveAttention(AbstractAttention):
         vals_exp = vals_exp.contiguous().view(-1, self.val_dim)
         logits = self.invoke(self.linear, self.combine(qrys_exp, vals_exp))
         logits = logits.squeeze(-1)
+        logits = logits.view(batch_size, max_num_qrys, max_num_vals)
 
         # handling for in-batch dynamic K
         if num_vals is not None:
@@ -128,13 +129,13 @@ class LinearAdditiveAttention(AdditiveAttention):
 
     def __init__(self, *args, **kwargs):
         super(LinearAdditiveAttention, self).__init__(*args, **kwargs)
-        self.linear = common.Linear(
+        self.linear_qv = common.Linear(
             in_features=self.qry_dim + self.val_dim,
             out_features=self.hidden_dim
         )
 
     def combine(self, qry_exp, vals_exp):
-        return self.invoke(self.linear, torch.cat([qry_exp, vals_exp], 1))
+        return self.invoke(self.linear_qv, torch.cat([qry_exp, vals_exp], 1))
 
 
 class FusionAdditiveAttention(AdditiveAttention):

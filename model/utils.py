@@ -84,7 +84,7 @@ class BeamsearchDecoder(object):
             xo, _, _ = invoke(self.rnn, x_emb, lens.view(-1), z_exp)
             xo = xo[:, -1].view(batch_size, cur_beamsize, -1)
             logits = embed_dot(self.emb, xo)
-            # for beams that already generated <eos>, no more probability
+            # for beams that already generated <eos>, prevent probability
             # depreciation.
             if self.eos is not None:
                 eos_mask = has_eos.unsqueeze(-1).float()
