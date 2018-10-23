@@ -3,17 +3,18 @@ import logging
 import argparse
 
 import torch
+import torchmodels
 import torch.nn as nn
 import torch.utils.data as td
 
 import utils
-import model
+import models
+import models.jlu
 import dataset
-from model import embedding
 from train import embeds
 
 
-MODES = model.MODES
+MODES = ["word", "label", "intent"]
 
 parser = argparse.ArgumentParser(fromfile_prefix_chars="@")
 
@@ -48,7 +49,9 @@ embeds.add_embed_arguments(group)
 group.add_argument("--gpu", type=int, action="append", default=[])
 
 group = parser.add_argument_group("Model Options")
-model.add_arguments(group)
+group.add_argument("--model-path", required=True)
+group.add_argument("--hidden-dim", type=int, default=300)
+group.add_argument("--word-dim", type=int, default=300)
 
 
 def prepare_dataset(args, vocab):
@@ -64,32 +67,42 @@ def prepare_dataset(args, vocab):
 
 
 def prepare_model(args, vocabs):
-    mdl = model.create_model(args, vocabs)
+    torchmodels.register_packages(models)
+    mdl_cls = torchmodels.create_model_cls(models.jlu, args.model_path)
+    mdl = mdl_cls(
+        hidden_dim=args.hidden_dim,
+        word_dim=args.word_dim,
+        num_words=len(vocabs[0]),
+        num_slots=len(vocabs[1]),
+        num_intents=len(vocabs[2])
+    )
     mdl.reset_parameters()
     ckpt = torch.load(args.ckpt_path)
     mdl.load_state_dict(ckpt)
     if args.expand_vocab:
-        mdl_vocab = vocabs[0]
-        mdl_emb = mdl.embeds[0].weight
-        emb = embeds.get_embeddings(args)
-        emb.preload()
-        emb = {w: v for w, v in emb}
-        for rword in [args.bos, args.eos, args.unk]:
-            emb[rword] = mdl_emb[mdl_vocab.f2i.get(rword)].detach().numpy()
-        vocab = utils.Vocabulary()
-        utils.populate_vocab(emb.keys(), vocab)
-        mdl.embeds[0] = embedding.BasicEmbedding(
-            vocab_size=len(vocab),
-            dim=mdl.word_dim,
-            allow_padding=True
-        )
-        embeds._load_embeddings(mdl.embeds[0], vocab, emb.items())
+        pass
+        # mdl_vocab = vocabs[0]
+        # mdl_emb = mdl.embeds[0].weight
+        # emb = embeds.get_embeddings(args)
+        # emb.preload()
+        # emb = {w: v for w, v in emb}
+        # for rword in [args.bos, args.eos, args.unk]:
+        #     emb[rword] = mdl_emb[mdl_vocab.f2i.get(rword)].detach().numpy()
+        # vocab = utils.Vocabulary()
+        # utils.populate_vocab(emb.keys(), vocab)
+        # mdl.embeds[0] = embedding.BasicEmbedding(
+        #     vocab_size=len(vocab),
+        #     dim=mdl.word_dim,
+        #     allow_padding=True
+        # )
+        # embeds._load_embeddings(mdl.embeds[0], vocab, emb.items())
     else:
         vocab = vocabs[0]
     return mdl, vocab
 
 
 class Predictor(object):
+
     def __init__(self, model, device, sent_vocab, label_vocab, intent_vocab,
                  bos, eos, unk, tensor_key="tensor"):
         self.model = model
@@ -142,8 +155,7 @@ class Predictor(object):
             batch_size, (w, lens) = self.prepare_batch(batch)
             progress.update(batch_size)
             (labels, intents), (pl, pi) = self.model.predict(
-                w, lens,
-                label_bos=self.bos_idxs[1],
+                w, lens, self.bos_idxs[1],
             )
             labels, intents, lens, pl, pi = \
                 [x.cpu().tolist() for x in [labels, intents, lens, pl[:, 0], pi]]

@@ -195,6 +195,10 @@ def tqdm(iterable=None, **kwargs):
 
 
 def config_basic_logger(args):
+    # reset logger
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
     def config_handler(args, handler):
         handler.setLevel(level=args.log_level)
     handlers = []
@@ -204,9 +208,7 @@ def config_basic_logger(args):
         handlers.append(shandler)
     if args.log_file:
         path = os.path.join(args.save_dir, args.log_filename)
-        assert not os.path.exists(path), \
-            f"a log file already exists at '{path}'"
-        fhandler = logging.FileHandler(path, mode="w")
+        fhandler = logging.FileHandler(path, mode=args.log_filemode)
         config_handler(args, fhandler)
         handlers.append(fhandler)
     logging.basicConfig(
@@ -277,6 +279,7 @@ def add_logging_arguments(parser, default_log_file):
     parser.add_argument("--log-stdout", action="store_true", default=False)
     parser.add_argument("--log-filename", type=str,
                         default=f"{default_log_file}.log")
+    parser.add_argument("--log-filemode", default="x")
 
 
 def merge_dict(a, b):
@@ -321,6 +324,7 @@ def exclude(items, ex):
 
 
 class UniversalFileReader(object):
+
     def __init__(self, default_ext=None):
         self.extdict = {}
         self.default_ext = default_ext
@@ -366,6 +370,10 @@ def initialize_script(parser):
     argstr = pprint.pformat(argdict, indent=4)
     logging.info(argstr)
     return args
+
+
+def log_object(obj, level=logging.INFO):
+    logging.log(level, pprint.pformat(obj, indent=4))
 
 
 def latter(_, b):

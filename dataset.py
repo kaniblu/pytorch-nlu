@@ -43,7 +43,7 @@ class TextSequenceDataset(td.Dataset):
     }
 
     def __init__(self, paths, feats=None, vocabs=None, vocab_limit=None,
-                 pad_bos=None, pad_eos=None, unk="<unk>"):
+                 pad_bos=None, pad_eos=None, unk="<unk>", max_len=None):
         if feats is None:
             feats = self.FEATURES
         if not isinstance(vocabs, collections.Sequence):
@@ -56,6 +56,7 @@ class TextSequenceDataset(td.Dataset):
         self.pad_bos = pad_bos
         self.unk = unk
         self.unk_idxs = [None] * len(paths)
+        self.max_len = max_len
         self.data = None
         if self.feats is None:
             self.feats = [""]

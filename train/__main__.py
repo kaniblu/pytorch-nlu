@@ -1,24 +1,27 @@
 import os
 import logging
+import tempfile
 import argparse
 import importlib
 import collections
 
 import numpy as np
 import torch
+import torchmodels
 import torch.nn as nn
 import torch.optim as op
 import torch.utils.data as td
 
 import utils
-import model
-import model.utils
+import models
+import models.jlu
 import dataset
 import predict
 import evaluate
+import inference
 from . import embeds
 
-MODES = model.MODES
+MODES = ["word", "label", "intent"]
 
 parser = argparse.ArgumentParser(fromfile_prefix_chars="@")
 parser.add_argument("--debug", action="store_true", default=False)
@@ -28,7 +31,9 @@ utils.add_logging_arguments(group, "train")
 group.add_argument("--show-progress", action="store_true", default=False)
 
 group = parser.add_argument_group("Model Options")
-model.add_arguments(group)
+group.add_argument("--model-path", required=True)
+group.add_argument("--hidden-dim", type=int, default=300)
+group.add_argument("--word-dim", type=int, default=300)
 
 group = parser.add_argument_group("Data Options")
 for mode in MODES:
@@ -38,6 +43,7 @@ group.add_argument("--vocab-limit", type=int, default=None)
 group.add_argument("--data-workers", type=int, default=8)
 group.add_argument("--pin-memory", action="store_true", default=False)
 group.add_argument("--shuffle", action="store_true", default=False)
+group.add_argument("--max-length", type=int, default=None)
 group.add_argument("--seed", type=int, default=None)
 group.add_argument("--unk", type=str, default="<unk>")
 group.add_argument("--eos", type=str, default="<eos>")
@@ -50,14 +56,18 @@ group.add_argument("--batch-size", type=int, default=32)
 group.add_argument("--epochs", type=int, default=12)
 group.add_argument("--optimizer", type=str, default="adam",
                    choices=["adam", "adamax", "adagrad", "adadelta", "sgd"])
+group.add_argument("--loss-alpha", type=float, default=1.0)
+group.add_argument("--loss-beta", type=float, default=1.0)
 group.add_argument("--early-stop", action="store_true", default=False)
 group.add_argument("--early-stop-patience", type=int, default=5)
 group.add_argument("--early-stop-save", action="store_true", default=False)
-group.add_argument("--early-stop-criteria", default="acc-label")
+group.add_argument("--early-stop-criterion", default="acc-label")
 group.add_argument("--learning-rate", type=float, default=None)
 group.add_argument("--weight-decay", type=float, default=None)
-group.add_argument("--samples", type=int, default=1)
+group.add_argument("--samples", type=int, default=None)
+group.add_argument("--log-stats", action="store_true", default=False)
 group.add_argument("--tensorboard", action="store_true", default=False)
+group.add_argument("--resume-from")
 group.add_argument("--gpu", type=int, action="append", default=[])
 
 group = parser.add_argument_group("Validation Options")
@@ -66,8 +76,7 @@ for mode in MODES:
     group.add_argument(f"--val-{mode}-path")
 
 group = parser.add_argument_group("Word Embeddings Options")
-for mode in MODES:
-    embeds.add_embed_arguments(group, mode)
+embeds.add_embed_arguments(group)
 
 
 def create_dataloader(args, vocabs=None, val=False):
@@ -93,22 +102,36 @@ def create_dataloader(args, vocabs=None, val=False):
     return td.DataLoader(
         dataset=dset,
         batch_size=args.batch_size,
-        shuffle=False if val else args.shuffle ,
+        shuffle=False if val else args.shuffle,
         num_workers=args.data_workers,
         collate_fn=collator,
         pin_memory=args.pin_memory
     )
 
 
-def prepare_model(args, vocabs):
-    mdl = model.create_model(args, vocabs)
+def prepare_model(args, vocabs, resume_from=None):
+    if resume_from is None:
+        resume_from = dict()
+
+    model_path = args.model_path
+    if resume_from.get("model_args") is not None:
+        temp_path = tempfile.mkstemp()[1]
+        utils.dump_yaml(resume_from["model_args"], temp_path)
+
+    torchmodels.register_packages(models)
+    mdl_cls = torchmodels.create_model_cls(models.jlu, model_path)
+    mdl = mdl_cls(
+        hidden_dim=args.hidden_dim,
+        word_dim=args.word_dim,
+        num_words=len(vocabs[0]),
+        num_slots=len(vocabs[1]),
+        num_intents=len(vocabs[2])
+    )
     mdl.reset_parameters()
-    for mode, vocab, emb in zip(MODES, vocabs, mdl.embeddings()):
-        embeds.load_embeddings(
-            args=utils.filter_namespace_prefix(args, mode),
-            vocab=vocab,
-            modules=[emb]
-        )
+    if resume_from.get("model") is not None:
+        mdl.load_state_dict(resume_from["model"])
+    else:
+        embeds.load_embeddings(args, vocabs[0], mdl.embeddings())
     return mdl
 
 
@@ -139,272 +162,202 @@ def randidx(x, size):
         return np.random.choice(np.arange(len(x)), p=x, size=size)
 
 
-class Trainer(object):
-    def __init__(self, debug, model, device, vocabs, epochs, save_dir,
-                 save_period, optimizer_cls=op.Adam, enable_tensorboard=False,
-                 show_progress=True, samples=None, tensor_key="tensor",
-                 predictor=None, validate=1,
-                 earlystop=False, patience=5, earlystop_save=False,
-                 earlystop_criteria="val-acc-sent"):
-        self.debug = debug
-        self.model = model
-        self.device = device
+class Validator(inference.LoggableInferencer, inference.Predictor):
+
+    def __init__(self, *args, **kwargs):
+        super(Validator, self).__init__(
+            *args,
+            name="valid",
+            tensorboard=False,
+            persistant_steps=False,
+            **kwargs
+        )
+
+    def on_run_started(self, dataloader):
+        super(Validator, self).on_run_started(dataloader)
+        self.labels_gold, self.intents_gold = list(), list()
+
+    def on_batch_started(self, batch):
+        super(Validator, self).on_batch_started(batch)
+        self.model.train(False)
+
+    def on_batch_finished(self, batch, model_outputs, losses, stats):
+        super(Validator, self)\
+            .on_batch_finished(batch, model_outputs, losses, stats)
+        # dataset might produce bos/eos-padded strings
+        labels_gold = [self.trim(x[1]) for x in batch["string"]]
+        intents_gold = [self.trim(x[2]) for x in batch["string"]]
+        self.labels_gold.extend(labels_gold)
+        self.intents_gold.extend(intents_gold)
+
+    def on_run_finished(self, stats):
+        preds = super(Validator, self).on_run_finished(stats)
+        assert preds is not None, "polymorphism gone wrong?"
+        lpreds, ipreds = [x[0][0] for x in preds], [x[1][0] for x in preds]
+        res = evaluate.evaluate(
+            gold_labels=self.labels_gold,
+            gold_intents=self.intents_gold,
+            pred_labels=lpreds,
+            pred_intents=ipreds
+        )
+        tasks = ["slot-labeling", "intent-classification"]
+        stats = {
+            f"val-{measure}-{mode}": v
+            for mode, task in zip(MODES[1:], tasks)
+            for measure, v in res[task]["overall"].items()
+        }
+        stats["val-acc-sent"] = res["sentence-understanding"]
+        msg = utils.join_dict(
+            {k: f"{v:.4f}" for k, v in stats.items()},
+            item_dlm=", ", kvp_dlm="="
+        )
+        self.log(msg, tag="eval")
+        return stats
+
+
+class Trainer(inference.LoggableInferencer):
+
+    def __init__(self, *args, epochs=10, optimizer_cls=op.Adam, model_path=None,
+                 save_period=None, samples=None, validator=None,
+                 early_stop=False, early_stop_patience=5,
+                 early_stop_criterion="val-acc-sent", **kwargs):
+        super(Trainer, self).__init__(
+            *args,
+            name="train",
+            persistant_steps=True,
+            **kwargs
+        )
         self.epochs = epochs
-        self.vocabs = vocabs
-        self.save_dir = save_dir
-        self.save_period = save_period
         self.optimizer_cls = optimizer_cls
-        self.tensor_key = tensor_key
-        self.enable_tensorboard = enable_tensorboard
-        self.cross_entropies = [nn.CrossEntropyLoss(ignore_index=len(vocab))
-                                for vocab in vocabs]
-        self.show_progress = show_progress
-        self.samples = samples
-        self.unk = "<unk>"
-        self.perform_validation = validate
-        self.predictor = predictor
-        self.earlystop = earlystop,
-        self.earlystop_patience = patience
-        self.earlystop_save = earlystop_save
-        self.earlystop_criteria = earlystop_criteria
-        self.earlystop_max = None
-        self.earlystop_max_eidx = None
-        self.earlystop_max_sd = None
-        self.earlystop_max_stats = None
+        self.show_samples = samples is not None
+        self.num_samples = samples
+        self.should_validate = validator is not None
+        self.validator = validator
+        self.should_save_periodically = save_period is not None
+        self.save_period = save_period
+        self.model_path = model_path
+        self.early_stop = early_stop
+        self.early_stop_patience = early_stop_patience
+        self.early_stop_criterion = early_stop_criterion
 
-        if self.enable_tensorboard:
-            self.tensorboard = importlib.import_module("tensorboardX")
-            self.writer = self.tensorboard.SummaryWriter(log_dir=self.save_dir)
-
-    @property
-    def module(self):
-        if isinstance(self.model, nn.DataParallel):
-            return self.model.module
-        else:
-            return self.model
+        self.global_step = 0
+        self.eidx = 0
+        self.optimizer = optimizer_cls(self.trainable_params())
+        self.early_stop_best = {
+            "crit": None,
+            "eidx": -1,
+            "sd": None,
+            "stats": None
+        }
 
     def trainable_params(self):
         for p in self.model.parameters():
             if p.requires_grad:
                 yield p
 
-    def prepare_batch(self, batch):
-        data = batch[self.tensor_key]
-        data = [(x.to(self.device), lens.to(self.device)) for x, lens in data]
-        (w, w_lens), (l, l_lens), (i, i_lens) = data
-        batch_size = w.size(0)
-        if self.debug:
-            assert (w_lens == l_lens).sum().item() == batch_size
-            assert (i_lens == 3).sum().item() == batch_size
-        return batch_size, (w, l, i[:, 1], w_lens)
-
-    def snapshot(self, eidx, state_dict=None):
-        if state_dict is None:
-            state_dict = self.module.state_dict()
-        path = os.path.join(self.save_dir, f"checkpoint-e{eidx:02d}")
+    def save_snapshot(self, state_dict, tag=None):
+        if tag is None:
+            tag = ""
+        else:
+            tag = f"-{tag}"
+        eidx = state_dict["eidx"]
+        path = os.path.join(self.save_dir, f"checkpoint-e{eidx:02d}{tag}")
         torch.save(state_dict, path)
         logging.info(f"checkpoint saved to '{path}'.")
 
-    def report_stats(self, stats):
-        if self.enable_tensorboard:
-            for k, v in stats.items():
-                self.writer.add_scalar(k.replace("-", "/"), v, self.global_step)
-        stats_str = {k: f"{v:.4f}" for k, v in stats.items()}
-        desc = utils.join_dict(stats_str, ", ", "=")
-        return desc
-
-    def report_samples(self, golds, logits=None, vocab=None,
-                       name="", lens=None, idx=None):
-        def to_sent(vec):
-            return " ".join(vocab.i2f.get(w, self.unk) for w in vec)
-        if self.samples is None:
-            return
-        if idx is None:
-            idx = torch.randperm(len(golds))[:self.samples]
-        golds = [golds[i.item()] for i in idx]
-        if logits is None:
-            for i, sent in enumerate(golds):
-                logging.info(f"{name.capitalize()} Sample #{i + 1:02d}:")
-                logging.info(f"Target:    {sent}")
-        else:
-            preds = logits.max(2)[1]
-            if lens is None:
-                lens = torch.full((len(logits), ), preds.size(1)).long()
-            preds, lens = preds[idx].cpu().tolist(), lens[idx].cpu().tolist()
-            preds = [to_sent(pred[:l]) for pred, l in zip(preds, lens)]
-            for i, (sent, pred) in enumerate(zip(golds, preds)):
-                logging.info(f"{name.capitalize()} Sample #{i + 1:02d}:")
-                logging.info(f"Target:    {sent}")
-                logging.info(f"Predicted: {pred}")
-
-    def report_all_samples(self, lgts, igts, wgld, lgld, igld, lens):
-        if self.samples is None:
-            return
-        igts = igts.unsqueeze(1)
-        idx = torch.randperm(len(lgts))[:self.samples]
-        self.report_samples(wgld, name="word", idx=idx)
-        self.report_samples(lgld, lgts, self.vocabs[1], "label", lens, idx)
-        self.report_samples(igld, igts, self.vocabs[2], "intent", idx=idx)
-
-    def calculate_celoss(self, ce, logits, targets):
-        logit_size = logits.size(-1)
-        logits = logits.view(-1, logit_size)
-        targets = targets.view(-1)
-        return ce(logits, targets)
-
-    def calculate_losses(self, logits_lst, gold_lst):
-        return {
-            f"loss-{mode}": self.calculate_celoss(ce, logits, gold)
-            for mode, ce, logits, gold in
-            zip(["label", "intent"], self.cross_entropies, logits_lst, gold_lst)
+    def snapshot(self, stats=None):
+        exp_state_dict = {
+            "eidx": self.eidx,
+            "model": {
+                k: v.detach().cpu()
+                for k, v in self.module.state_dict().items()
+            },
+            "global_step": self.global_step,
+            "optimizer": self.optimizer.state_dict(),
         }
+        if self.model_path is not None:
+            exp_state_dict["model_args"] = utils.load_yaml(self.model_path)
+        if stats is not None:
+            exp_state_dict["stats"] = stats
+        return exp_state_dict
 
-    def calculate_acc(self, logits, targets, ignore_index):
-        preds = logits.max(-1)[1]
-        mask = (targets != ignore_index).float()
-        correct = ((preds == targets).float() * mask).sum().item()
-        total = mask.sum().item()
-        return correct / total
-
-    def calculate_accuracies(self, logits_lst, gold_lst):
-        return {
-            f"acc-{mode}": self.calculate_acc(logits, golds, len(vocab))
-            for mode, logits, golds, vocab in
-            zip(MODES[1:], logits_lst, gold_lst, self.vocabs)
-        }
-
-    def trim_beos(self, sent):
-        return " ".join(sent.split()[1:-1])
-
-    def validate(self, eidx, dataloader):
-        if self.predictor is None:
-            return
-        with torch.no_grad():
-            (lpreds, ipreds), _ = self.predictor.predict(dataloader)
-        lpreds = [self.trim_beos(l) for l in lpreds]
-        lgolds, igolds = [], []
-        for batch in dataloader:
-            _, lb, ib = list(zip(*batch["string"]))
-            lgolds.extend([self.trim_beos(l) for l in lb])
-            igolds.extend([self.trim_beos(i) for i in ib])
-        res = evaluate.evaluate(lgolds, igolds, lpreds, ipreds)
-        tasks = ["slot-labeling", "intent-classification"]
-        valstats = {
-            f"val-{measure}-{mode}": v
-            for mode, task in zip(MODES[1:], tasks)
-            for measure, v in res[task]["overall"].items()
-        }
-        valstats["val-acc-sent"] = res["sentence-understanding"]
-        logging.info(f"[{eidx}] {self.report_stats(valstats)}")
-        return valstats
+    def load_snapshot(self, state_dict):
+        if self.optimizer is not None and "optimizer" in state_dict:
+            self.optimizer.load_state_dict(state_dict["optimizer"])
+        if "global_step" in state_dict:
+            self.global_step = state_dict["global_step"]
+        if "eidx" in state_dict:
+            self.eidx = state_dict["eidx"]
 
     def should_stop(self, eidx, stats):
-        if not self.earlystop:
+        if not self.early_stop:
             return False
-        assert self.earlystop_criteria in stats, \
-            f"early stop criteria not found in training stats: " \
-            f"{self.earlystop_criteria} not in {stats.keys()}"
-        crit = stats.get(self.earlystop_criteria)
-        if self.earlystop_max is None or crit > self.earlystop_max:
-            self.earlystop_max = crit
-            self.earlystop_max_eidx = eidx
-            self.earlystop_sd = {
-                k: v.detach() for k, v in self.module.state_dict().items()
-            }
-            self.earlystop_max_stats = stats
-        return self.earlystop_max_eidx is not None and \
-               eidx >= self.earlystop_max_eidx + self.earlystop_patience
+        assert self.early_stop_criterion in stats, \
+            f"early stop criterion not found in training stats: " \
+            f"{self.early_stop_criterion} not in {stats.keys()}"
+        crit = stats.get(self.early_stop_criterion)
+        if self.early_stop_best["crit"] is None or crit > self.early_stop_best["crit"]:
+            self.early_stop_best["crit"] = crit
+            self.early_stop_best["sd"] = self.snapshot(stats)
+        return self.early_stop_best["sd"]["eidx"] is not None and \
+               eidx >= self.early_stop_best["sd"]["eidx"] + \
+                       self.early_stop_patience
 
     def report_early_stop(self, eidx):
-        stats_str = {k: f"{v:.4f}" for k, v in self.earlystop_max_stats.items()}
-        logging.info(f"early stopping at {eidx} epoch as criteria "
-                     f"({self.earlystop_criteria}) remains unchallenged "
-                     f"for {self.earlystop_patience} epochs.")
+        stats_str = {k: f"{v:.4f}" for k, v in
+                     self.early_stop_best["stats"].items()}
+        logging.info(f"early stopping at {eidx} epoch as criterion "
+                     f"({self.early_stop_criterion}) remains unchallenged "
+                     f"for {self.early_stop_patience} epochs.")
         logging.info(f"best stats so far:")
-        logging.info(f"[{eidx - self.earlystop_patience}] "
+        logging.info(f"[{eidx - self.early_stop_patience}] "
                      f"{utils.join_dict(stats_str, ', ', '=')}")
 
+    def on_batch_started(self, batch):
+        super(Trainer, self).on_batch_started(batch)
+        self.model.train(True)
+        self.optimizer.zero_grad()
+
+    def on_batch_finished(self, batch, model_outputs, losses, stats):
+        super(Trainer, self)\
+            .on_batch_finished(batch, model_outputs, losses, stats)
+        loss = losses["loss-total"]
+        loss.backward()
+        self.optimizer.step()
+
     def train(self, dataloader, val_dataloader=None):
-        self.global_step = 0
-        optimizer = self.optimizer_cls(list(self.trainable_params()))
-        progress_global = utils.tqdm(
+        if self.should_validate:
+            assert val_dataloader is not None, \
+                "must provide validation data if i need to validate"
+        self.optimizer = self.optimizer_cls(self.trainable_params())
+        self.progress_global = utils.tqdm(
             total=self.epochs,
             desc=f"training {self.epochs} epochs",
             disable=not self.show_progress
         )
+        self.progress_global.update(self.eidx)
+        for self.eidx in range(self.eidx + 1, self.epochs + 1):
+            self.progress_global.update(1)
+            self.progress_global.set_description(f"training e{self.eidx:02d}")
+            stats = self.inference(dataloader)
 
-        for eidx in range(1, self.epochs + 1):
-            self.local_step = 0
-            stats_cum = collections.defaultdict(float)
-            progress_global.update(1)
-            progress_local = utils.tqdm(
-                total=len(dataloader.dataset),
-                desc=f"training an epoch",
-                disable=not self.show_progress
-            )
-            for batch in dataloader:
-                self.model.train(True)
-                optimizer.zero_grad()
-                batch_size, (w, l, i, lens) = self.prepare_batch(batch)
-                self.global_step += batch_size
-                self.local_step += batch_size
-                progress_local.update(batch_size)
-                ret = self.model(w, l, lens)
-                label_logits, intent_logits = ret.get("pass")
-                losses = self.calculate_losses(
-                    logits_lst=[label_logits, intent_logits],
-                    gold_lst=[l, i]
+            if self.should_validate:
+                with torch.no_grad():
+                    valstats = self.validator.inference(val_dataloader)
+                stats.update(valstats)
+
+            if self.should_save_periodically \
+                and self.eidx % self.save_period == 0:
+                self.save_snapshot(self.snapshot())
+
+            if self.should_stop(self.eidx, stats):
+                self.save_snapshot(
+                    state_dict=self.early_stop_best["sd"],
+                    tag=f"best-{self.early_stop_best['crit']:.4f}"
                 )
-                loss = sum(losses.values())
-                loss.backward()
-                if self.debug:
-                    for p in self.model.parameters():
-                        if p.grad is None:
-                            continue
-                        if (p.grad != p.grad).float().sum().item() > 0:
-                            logging.error(f"[epoch: {eidx}] NaN detected in "
-                                          f"gradients of parameter "
-                                          f"(size: {p.size()})")
-                optimizer.step()
-
-                stats = losses
-                stats.update(self.calculate_accuracies(
-                    logits_lst=[label_logits, intent_logits],
-                    gold_lst=[l, i]
-                ))
-                for k, v in stats.items():
-                    stats_cum[k] += v * batch_size
-
-                items_lst = list(zip(*batch.get("string")))
-                self.report_all_samples(
-                    lgts=label_logits,
-                    igts=intent_logits,
-                    wgld=items_lst[0],
-                    lgld=items_lst[1],
-                    igld=items_lst[2],
-                    lens=lens
-                )
-
-            progress_local.close()
-            stats_cum = {k: v / self.local_step for k, v in stats_cum.items()}
-            logging.info(f"[{eidx}] {self.report_stats(stats_cum)}")
-
-            if self.perform_validation:
-                stats_cum.update(self.validate(eidx, val_dataloader))
-
-            if self.save_period is not None and \
-                    eidx % self.save_period == 0:
-                self.snapshot(eidx)
-
-            if self.should_stop(eidx, stats_cum):
-                if self.earlystop_save:
-                    self.snapshot(
-                        eidx=self.earlystop_max_eidx,
-                        state_dict=self.earlystop_max_sd
-                    )
-                self.report_early_stop(eidx)
+                self.report_early_stop(self.eidx)
                 break
-        progress_global.close()
+        self.progress_global.close()
 
 
 def report_model(trainer):
@@ -430,43 +383,47 @@ def train(args):
         utils.save_pkl(vocab, os.path.join(args.save_dir, fname))
 
     logging.info("Initializing training environment...")
-    mdl = prepare_model(args, vocabs)
+    resume_from = dict()
+    if args.resume_from is not None:
+        resume_from = torch.load(args.resume_from)
+    mdl = prepare_model(args, vocabs, resume_from)
     mdl = utils.to_device(mdl, devices)
     optimizer_cls = get_optimizer_cls(args)
+    validator = None
     if args.validate:
-        predictor = predict.Predictor(
+        validator = Validator(
             model=mdl,
             device=devices[0],
-            sent_vocab=vocabs[0],
-            label_vocab=vocabs[1],
-            intent_vocab=vocabs[2],
+            vocabs=vocabs,
             bos=args.bos,
             eos=args.eos,
             unk=args.unk,
-            tensor_key="tensor"
+            alpha=args.loss_alpha,
+            beta=args.loss_beta,
+            progress=args.show_progress,
+            batch_stats=args.log_stats
         )
-    else:
-        predictor = None
     trainer = Trainer(
-        debug=args.debug,
         model=mdl,
+        model_path=args.model_path,
+        alpha=args.loss_alpha,
+        beta=args.loss_beta,
         device=devices[0],
         vocabs=vocabs,
         epochs=args.epochs,
         save_dir=args.save_dir,
         save_period=args.save_period,
         optimizer_cls=optimizer_cls,
-        tensor_key="tensor",
         samples=args.samples,
-        enable_tensorboard=args.tensorboard,
-        show_progress=args.show_progress,
-        predictor=predictor,
-        validate=args.validate,
-        earlystop=args.early_stop,
-        earlystop_criteria=args.early_stop_criteria,
-        earlystop_save=args.early_stop_save,
-        patience=args.early_stop_patience
+        tensorboard=args.tensorboard,
+        progress=args.show_progress,
+        validator=validator,
+        batch_stats=args.log_stats,
+        early_stop=args.early_stop,
+        early_stop_criterion=args.early_stop_criterion,
+        early_stop_patience=args.early_stop_patience
     )
+    trainer.load_snapshot(resume_from)
     report_model(trainer)
 
     logging.info("Commencing training joint-lu...")

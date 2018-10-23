@@ -81,6 +81,7 @@ def evaluate_conlleval(golds, preds):
 
 
 class ConllEvaluator(object):
+
     START_TAGS = {
         ("B", "B"),
         ("I", "B"),
@@ -102,6 +103,9 @@ class ConllEvaluator(object):
         ("I", "O")
     }
 
+    def __init__(self, detailed=False):
+        self.detailed = detailed
+
     def is_chunk_start(self, ptag, tag, ptag_type, tag_type):
         return (ptag, tag) in self.START_TAGS or \
                (tag != "O" and tag != "." and ptag_type != tag_type)
@@ -122,9 +126,27 @@ class ConllEvaluator(object):
             tag = s[0]
             tag_type = s[1]
         return tag, tag_type
-    
+
+    @staticmethod
+    def form_stats(num_correct, num_pred, num_gold):
+        rec, prec, f1 = 0.0, 0.0, 0.0
+        if num_pred > 0:
+            prec = num_correct / num_pred
+        if num_gold > 0:
+            rec = num_correct / num_gold
+        if rec + prec > 0.0:
+            f1 = 2 * rec * prec / (rec + prec)
+        return {
+            #"correct": num_correct,
+            #"predicted": num_pred,
+            #"gold": num_gold,
+            "rec": rec,
+            "prec": prec,
+            "f1": f1
+        }
+
     def evaluate(self, golds, preds):
-        """ 
+        """
         https://github.com/MiuLab/SlotGated-SLU/blob/master/utils.py
         :param golds:
         :param preds:
@@ -150,7 +172,7 @@ class ConllEvaluator(object):
 
                 if in_correct:
                     if self.is_chunk_end(last_correct_tag, correct_tag,
-                                     last_correct_type, correct_type) and \
+                                         last_correct_type, correct_type) and \
                             self.is_chunk_end(last_pred_tag, pred_tag,
                                               last_pred_type, pred_type) and \
                             last_correct_type == last_pred_type:
@@ -161,7 +183,7 @@ class ConllEvaluator(object):
                         else:
                             correct_chunk[last_correct_type] = 1
                     elif self.is_chunk_end(last_correct_tag, correct_tag,
-                                       last_correct_type, correct_type) != \
+                                           last_correct_type, correct_type) != \
                             self.is_chunk_end(last_pred_tag, pred_tag,
                                               last_pred_type, pred_type) or \
                             correct_type != pred_type:
@@ -206,28 +228,23 @@ class ConllEvaluator(object):
                 else:
                     correct_chunk[last_correct_type] = 1
 
-        if found_pred_cnt > 0:
-            precision = 100 * correct_chunk_cnt / found_pred_cnt
-        else:
-            precision = 0
-
-        if found_correct_cnt > 0:
-            recall = 100 * correct_chunk_cnt / found_correct_cnt
-        else:
-            recall = 0
-
-        if (precision + recall) > 0:
-            f1 = (2 * precision * recall) / (precision + recall)
-        else:
-            f1 = 0
-
-        return {
-            "overall": {
-                "f1": f1,
-                "prec": precision,
-                "rec": recall
-            }
+        classes = set(found_correct) | set(found_pred) | set(correct_chunk)
+        ret = {
+            "overall": self.form_stats(
+                correct_chunk_cnt,
+                found_pred_cnt,
+                found_correct_cnt
+            )
         }
+        if self.detailed:
+            ret.update({
+                "slots": {c: self.form_stats(
+                    correct_chunk.get(c, 0),
+                    found_pred.get(c, 0),
+                    found_correct.get(c, 0),
+                ) for c in classes},
+            })
+        return ret
 
 
 def evaluate(golds, preds):

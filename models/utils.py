@@ -56,6 +56,7 @@ def embed_dot(emb, x):
 
 
 class BeamsearchDecoder(object):
+
     def __init__(self, rnn, emb, bos, eos=None, maxlen=100, beam_size=3):
         self.rnn = rnn
         self.emb = emb
