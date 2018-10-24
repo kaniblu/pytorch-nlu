@@ -2,13 +2,10 @@ import os
 import logging
 import tempfile
 import argparse
-import importlib
-import collections
 
 import numpy as np
 import torch
 import torchmodels
-import torch.nn as nn
 import torch.optim as op
 import torch.utils.data as td
 
@@ -16,7 +13,6 @@ import utils
 import models
 import models.jlu
 import dataset
-import predict
 import evaluate
 import inference
 from . import embeds
@@ -305,7 +301,7 @@ class Trainer(inference.LoggableInferencer):
 
     def report_early_stop(self, eidx):
         stats_str = {k: f"{v:.4f}" for k, v in
-                     self.early_stop_best["stats"].items()}
+                     self.early_stop_best["sd"]["stats"].items()}
         logging.info(f"early stopping at {eidx} epoch as criterion "
                      f"({self.early_stop_criterion}) remains unchallenged "
                      f"for {self.early_stop_patience} epochs.")

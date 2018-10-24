@@ -211,6 +211,7 @@ class Predictor(Inferencer):
 
     def on_run_started(self, dataloader):
         super(Predictor, self).on_run_started(dataloader)
+        self.model.train(False)
         self.labels, self.intents = list(), list()
         self.lprobs, self.iprobs = list(), list()
 
