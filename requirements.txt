@@ -1,3 +1,5 @@
+numpy
+sklearn
 pytorch-models==0.1.7
 tensorboardX==1.4
 torch==0.4.1
