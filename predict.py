@@ -78,7 +78,7 @@ def prepare_model(args, vocabs):
     )
     mdl.reset_parameters()
     ckpt = torch.load(args.ckpt_path)
-    mdl.load_state_dict(ckpt)
+    mdl.load_state_dict(ckpt["model"])
     if args.expand_vocab:
         pass
         # mdl_vocab = vocabs[0]
