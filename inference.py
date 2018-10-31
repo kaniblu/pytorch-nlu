@@ -316,9 +316,8 @@ class Predictor(AbstractInferencer):
 
         slots, intents, sprobs, iprobs, lens = \
             [x.cpu().tolist() for x in [slots, intents, sprobs, iprobs, lens]]
-        slots = [[self.trim(self.to_sent(s[:l], self.vocabs[1]))
-                  for s, l in zip(ss, ls)]
-                 for ss, ls in zip(slots, lens)]
+        slots = [[self.trim(self.to_sent(s[:l], self.vocabs[1])) for s in ss]
+                 for ss, l in zip(slots, lens)]
         intents = [[self.to_sent([i], self.vocabs[2]) for i in ii]
                    for ii in intents]
         self.labels.extend(slots)
@@ -330,5 +329,4 @@ class Predictor(AbstractInferencer):
 
     def on_run_finished(self, stats):
         super(Predictor, self).on_run_finished(stats)
-        return [((s, sp), (i, ip)) for s, i, sp, ip in
-                zip(self.labels, self.intents, self.lprobs, self.iprobs)]
+        return (self.labels, self.lprobs), (self.intents, self.iprobs)

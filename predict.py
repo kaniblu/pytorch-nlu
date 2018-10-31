@@ -39,7 +39,6 @@ group = parser.add_argument_group("Prediction Options")
 group.add_argument("--ckpt-path", type=str, required=True)
 group.add_argument("--batch-size", type=int, default=32)
 group.add_argument("--save-dir", type=str, required=True)
-group.add_argument("--show-progress", action="store_true", default=False)
 group.add_argument("--top-k", type=int, default=1,
                    help="top-k candidates of labels and intents to consider")
 for mode in MODES[1:]:
@@ -111,17 +110,24 @@ class PredictorWithProgress(inference.Predictor):
         super(PredictorWithProgress, self).__init__(*args, **kwargs)
         self.show_progress = progress
 
+    def select_data(self, data):
+        return data[0]
+
+    def model_call(self, data):
+        return self.model.predict(*data, self.topk)
+
     def on_run_started(self, dataloader):
         ret = super(PredictorWithProgress, self).on_run_started(dataloader)
         self.progress = utils.tqdm(
             total=len(dataloader.dataset),
+            desc="predicting",
             disable=not self.show_progress
         )
         return ret
 
     def on_batch_started(self, batch):
         ret = super(PredictorWithProgress, self).on_batch_started(batch)
-        self.progress.update(len(batch["string"][0]))
+        self.progress.update(len(batch["string"]))
         return ret
 
     def on_run_finished(self, stats):
@@ -200,7 +206,7 @@ class PredictorWithProgress(inference.Predictor):
 
 
 def save(args, labels, intents, pl, pi):
-    labels = [" ".join(label.split()[1:-1]) for label in labels]
+    labels = [" ".join(label.split()) for label in labels]
     pl, pi = [list(map(str, p)) for p in [pl, pi]]
     samples = [labels, intents, pl, pi]
     fnames = [args.label_filename, args.intent_filename,
@@ -246,7 +252,7 @@ def generate(args):
         bos=args.bos,
         eos=args.eos,
         unk=args.unk,
-        topk=args.topk
+        topk=args.top_k
     )
 
     logging.info("Commencing prediction...")
