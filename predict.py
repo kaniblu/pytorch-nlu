@@ -11,6 +11,7 @@ import utils
 import models
 import models.jlu
 import dataset
+import inference
 from train import embeds
 
 
@@ -38,6 +39,9 @@ group = parser.add_argument_group("Prediction Options")
 group.add_argument("--ckpt-path", type=str, required=True)
 group.add_argument("--batch-size", type=int, default=32)
 group.add_argument("--save-dir", type=str, required=True)
+group.add_argument("--show-progress", action="store_true", default=False)
+group.add_argument("--top-k", type=int, default=1,
+                   help="top-k candidates of labels and intents to consider")
 for mode in MODES[1:]:
     group.add_argument(f"--{mode}-filename", type=str, default=f"{mode}.txt")
     group.add_argument(f"--{mode}-probs-filename",
@@ -101,71 +105,98 @@ def prepare_model(args, vocabs):
     return mdl, vocab
 
 
-class Predictor(object):
+class PredictorWithProgress(inference.Predictor):
 
-    def __init__(self, model, device, sent_vocab, label_vocab, intent_vocab,
-                 bos, eos, unk, tensor_key="tensor"):
-        self.model = model
-        self.device = device
-        self.sent_vocab = sent_vocab
-        self.label_vocab = label_vocab
-        self.intent_vocab = intent_vocab
-        self.vocabs = [self.sent_vocab, self.label_vocab, self.intent_vocab]
-        self.bos = bos
-        self.eos = eos
-        self.unk = unk
-        self.bos_idxs = [v.f2i.get(bos) for v in self.vocabs]
-        self.eos_idxs = [v.f2i.get(eos) for v in self.vocabs]
-        self.unk_idxs = [v.f2i.get(unk) for v in self.vocabs]
-        self.tensor_key = tensor_key
+    def __init__(self, *args, progress=False, **kwargs):
+        super(PredictorWithProgress, self).__init__(*args, **kwargs)
+        self.show_progress = progress
 
-    @property
-    def module(self):
-        if isinstance(self.model, nn.DataParallel):
-            return self.model.module
-        else:
-            return self.model
+    def on_run_started(self, dataloader):
+        ret = super(PredictorWithProgress, self).on_run_started(dataloader)
+        self.progress = utils.tqdm(
+            total=len(dataloader.dataset),
+            disable=not self.show_progress
+        )
+        return ret
 
-    def to_sent(self, idx, vocab):
-        return " ".join(vocab.i2f.get(w, self.unk) for w in idx)
+    def on_batch_started(self, batch):
+        ret = super(PredictorWithProgress, self).on_batch_started(batch)
+        self.progress.update(len(batch["string"][0]))
+        return ret
 
-    def validate(self, sent, labels, intent, length, w_prob, l_prob):
-        """validate a single instance of sample"""
-        words, labels = sent.split(), labels.split()
-        def ensure_enclosed(x):
-            return x[0] == self.bos and x[-1] == self.eos
-        if not ensure_enclosed(words) or not ensure_enclosed(labels):
-            return False
-        if len(words) != len(labels):
-            return False
-        return True
-
-    def prepare_batch(self, batch):
-        x, lens = batch[self.tensor_key][0]
-        x, lens = x.to(self.device), lens.to(self.device)
-        batch_size = x.size(0)
-        return batch_size, (x, lens)
+    def on_run_finished(self, stats):
+        ret = super(PredictorWithProgress, self).on_run_finished(stats)
+        self.progress.close()
+        return ret
 
     def predict(self, dataloader):
-        vocabs = [self.sent_vocab, self.label_vocab, self.intent_vocab]
-        self.model.train(False)
-        progress = utils.tqdm(total=len(dataloader.dataset), desc="predicting")
-        preds = []
-        for batch in dataloader:
-            batch_size, (w, lens) = self.prepare_batch(batch)
-            progress.update(batch_size)
-            (labels, intents), (pl, pi) = self.model.predict(
-                w, lens, self.bos_idxs[1],
-            )
-            labels, intents, lens, pl, pi = \
-                [x.cpu().tolist() for x in [labels, intents, lens, pl[:, 0], pi]]
-            labels = [self.to_sent(label[:l], vocabs[1])
-                      for label, l in zip(labels, lens)]
-            intents = [self.to_sent([i], vocabs[2]) for i in intents]
-            preds.extend(list(zip(labels, intents, pl, pi)))
-        progress.close()
-        labels, intents, pl, pi = list(zip(*preds))
-        return (labels, intents), (pl, pi)
+        return self.inference(dataloader)
+
+# class Predictor(object):
+#
+#     def __init__(self, model, device, sent_vocab, label_vocab, intent_vocab,
+#                  bos, eos, unk, tensor_key="tensor"):
+#         self.model = model
+#         self.device = device
+#         self.sent_vocab = sent_vocab
+#         self.label_vocab = label_vocab
+#         self.intent_vocab = intent_vocab
+#         self.vocabs = [self.sent_vocab, self.label_vocab, self.intent_vocab]
+#         self.bos = bos
+#         self.eos = eos
+#         self.unk = unk
+#         self.bos_idxs = [v.f2i.get(bos) for v in self.vocabs]
+#         self.eos_idxs = [v.f2i.get(eos) for v in self.vocabs]
+#         self.unk_idxs = [v.f2i.get(unk) for v in self.vocabs]
+#         self.tensor_key = tensor_key
+#
+#     @property
+#     def module(self):
+#         if isinstance(self.model, nn.DataParallel):
+#             return self.model.module
+#         else:
+#             return self.model
+#
+#     def to_sent(self, idx, vocab):
+#         return " ".join(vocab.i2f.get(w, self.unk) for w in idx)
+#
+#     def validate(self, sent, labels, intent, length, w_prob, l_prob):
+#         """validate a single instance of sample"""
+#         words, labels = sent.split(), labels.split()
+#         def ensure_enclosed(x):
+#             return x[0] == self.bos and x[-1] == self.eos
+#         if not ensure_enclosed(words) or not ensure_enclosed(labels):
+#             return False
+#         if len(words) != len(labels):
+#             return False
+#         return True
+#
+#     def prepare_batch(self, batch):
+#         x, lens = batch[self.tensor_key][0]
+#         x, lens = x.to(self.device), lens.to(self.device)
+#         batch_size = x.size(0)
+#         return batch_size, (x, lens)
+#
+#     def predict(self, dataloader):
+#         vocabs = [self.sent_vocab, self.label_vocab, self.intent_vocab]
+#         self.model.train(False)
+#         progress = utils.tqdm(total=len(dataloader.dataset), desc="predicting")
+#         preds = []
+#         for batch in dataloader:
+#             batch_size, (w, lens) = self.prepare_batch(batch)
+#             progress.update(batch_size)
+#             (labels, intents), (pl, pi) = self.model.predict(
+#                 w, lens, self.bos_idxs[1],
+#             )
+#             labels, intents, lens, pl, pi = \
+#                 [x.cpu().tolist() for x in [labels, intents, lens, pl[:, 0], pi]]
+#             labels = [self.to_sent(label[:l], vocabs[1])
+#                       for label, l in zip(labels, lens)]
+#             intents = [self.to_sent([i], vocabs[2]) for i in intents]
+#             preds.extend(list(zip(labels, intents, pl, pi)))
+#         progress.close()
+#         labels, intents, pl, pi = list(zip(*preds))
+#         return (labels, intents), (pl, pi)
 
 
 def save(args, labels, intents, pl, pi):
@@ -207,20 +238,22 @@ def generate(args):
     model, vocabs[0] = prepare_model(args, vocabs)
     model.beam_size = args.beam_size
     model = utils.to_device(model, devices)
-    predictor = Predictor(
+    predictor = PredictorWithProgress(
         model=model,
         device=devices[0],
-        sent_vocab=vocabs[0],
-        label_vocab=vocabs[1],
-        intent_vocab=vocabs[2],
+        vocabs=vocabs,
+        progress=args.show_progress,
         bos=args.bos,
         eos=args.eos,
-        unk=args.unk
+        unk=args.unk,
+        topk=args.topk
     )
 
     logging.info("Commencing prediction...")
     with torch.no_grad():
-        (labels, intents), (pl, pi) = predictor.predict(test_dataloader)
+        (labels, pl), (intents, pi) = predictor.predict(test_dataloader)
+    labels, intents = [l[0] for l in labels], [i[0] for i in intents]
+    pl, pi = [p[0] for p in pl], [p[0] for p in pi]
     report_stats(args, labels, intents, pl, pi)
     save(args, labels, intents, pl, pi)
 

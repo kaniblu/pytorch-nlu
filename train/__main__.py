@@ -158,7 +158,8 @@ def randidx(x, size):
         return np.random.choice(np.arange(len(x)), p=x, size=size)
 
 
-class Validator(inference.LoggableInferencer, inference.Predictor):
+class Validator(inference.LoggableLossInferencer,
+                inference.PredictingLossInferencer):
 
     def __init__(self, *args, **kwargs):
         super(Validator, self).__init__(
@@ -177,9 +178,9 @@ class Validator(inference.LoggableInferencer, inference.Predictor):
         super(Validator, self).on_batch_started(batch)
         self.model.train(False)
 
-    def on_batch_finished(self, batch, model_outputs, losses, stats):
+    def on_loss_calculated(self, batch, data, model_outputs, losses, stats):
         super(Validator, self)\
-            .on_batch_finished(batch, model_outputs, losses, stats)
+            .on_loss_calculated(batch, data, model_outputs, losses, stats)
         # dataset might produce bos/eos-padded strings
         labels_gold = [self.trim(x[1]) for x in batch["string"]]
         intents_gold = [self.trim(x[2]) for x in batch["string"]]
@@ -211,7 +212,7 @@ class Validator(inference.LoggableInferencer, inference.Predictor):
         return stats
 
 
-class Trainer(inference.LoggableInferencer):
+class Trainer(inference.LoggableLossInferencer):
 
     def __init__(self, *args, epochs=10, optimizer_cls=op.Adam, model_path=None,
                  save_period=None, samples=None, validator=None,
@@ -314,12 +315,13 @@ class Trainer(inference.LoggableInferencer):
         self.model.train(True)
         self.optimizer.zero_grad()
 
-    def on_batch_finished(self, batch, model_outputs, losses, stats):
-        super(Trainer, self)\
-            .on_batch_finished(batch, model_outputs, losses, stats)
+    def on_loss_calculated(self, batch, data, model_outputs, losses, stats):
+        ret = super(Trainer, self)\
+            .on_loss_calculated(batch, data, model_outputs, losses, stats)
         loss = losses["loss-total"]
         loss.backward()
         self.optimizer.step()
+        return ret
 
     def train(self, dataloader, val_dataloader=None):
         if self.should_validate:

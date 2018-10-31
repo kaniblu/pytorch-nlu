@@ -1,3 +1,4 @@
+import torch
 import torch.nn.functional as F
 import torchmodels
 from torchmodels.modules import rnn
@@ -5,6 +6,7 @@ from torchmodels.modules import pooling
 from torchmodels.modules import embedding
 
 from . import classifier
+from . import utils
 
 
 class AbstractJointLU(torchmodels.Module):
@@ -28,7 +30,20 @@ class AbstractJointLU(torchmodels.Module):
     def forward(self, w, s, lens):
         raise NotImplementedError()
 
-    def predict(self, w, lens, slot_bos):
+    def predict(self, w, lens, topk=10, **kwargs):
+        """
+        Predicts and returns the most likely candidates for slots and intents
+        :param w:
+        :param lens:
+        :param topk:
+        :return: ((slot_candidates, slot_probs), \
+                  (intent_candidates, intent_probs))
+
+            tuple(tuple([batch_size x topk x max_len] LongTensor, \
+                        [batch_size x topk] FloatTensor), \
+                  tuple([batch_size x topk] LongTensor, \
+                        [batch_size x topk] FloatTensor))
+        """
         raise NotImplementedError()
 
 
@@ -88,10 +103,15 @@ class RNNBasedJLU(AbstractJointLU):
         lgts = self._forward_slots(hs)
         return lgts, igts
 
-    def predict(self, w, lens, slot_bos):
+    def predict(self, w, lens, topk=10, **kwargs):
         lgts, igts = self.forward(w, None, lens)
-        sprobs = F.softmax(lgts, 2)
-        iprobs = F.softmax(igts, 1)
-        sprobs, slots = sprobs.max(2)
-        sprobs = sprobs.prod(1).unsqueeze(1)
-        return (slots, igts.max(1)[1]), (sprobs, iprobs)
+        slot_logprobs = F.log_softmax(lgts, 2)
+        bs = utils.BeamSearchDecoder(slot_logprobs, lens, topk)
+        slot_candidates, slot_logprobs = bs.decode()
+        slot_probs = slot_logprobs.exp()
+        intent_probs, intent_candidates = \
+            torch.sort(F.softmax(igts, 1), 1, True)
+        intent_probs = intent_probs[:, :topk]
+        intent_candidates = intent_candidates[:, :topk]
+        return (slot_candidates, slot_probs), \
+               (intent_candidates, intent_probs)
