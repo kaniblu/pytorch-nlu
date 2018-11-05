@@ -52,10 +52,10 @@ def evaluate_intents(golds, preds, detailed=False):
     return cast_float(ret)
 
 import logging
-def evaluate(gold_labels, gold_intents, pred_labels, pred_intents):
+def evaluate(gold_labels, gold_intents, pred_labels, pred_intents, detailed=False):
     ret = dict()
-    ret["intent-classification"] = evaluate_intents(gold_intents, pred_intents)
-    ret["slot-labeling"] = slots.ConllEvaluator().evaluate(
+    ret["intent-classification"] = evaluate_intents(gold_intents, pred_intents, detailed)
+    ret["slot-labeling"] = slots.ConllEvaluator(detailed).evaluate(
         golds=[l.split() for l in gold_labels],
         preds=[l.split() for l in pred_labels]
     )

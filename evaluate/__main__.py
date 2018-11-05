@@ -13,6 +13,7 @@ parser.add_argument("--gold-label-path", required=True)
 parser.add_argument("--gold-intent-path", required=True)
 parser.add_argument("--format", default="yaml",
                     choices=["yaml", "json"])
+parser.add_argument("--detailed", action="store_true", default=False)
 
 
 def load(path):
@@ -24,7 +25,7 @@ def eval(args):
     lpreds, ipreds = load(args.label_path), load(args.intent_path)
     lgolds, igolds = \
         load(args.gold_label_path), load(args.gold_intent_path)
-    res = evaluate(lgolds, igolds, lpreds, ipreds)
+    res = evaluate(lgolds, igolds, lpreds, ipreds, detailed=args.detailed)
     dump = utils.map_val(args.format, {
         "yaml": utils.dump_yaml,
         "json": json.dump,
